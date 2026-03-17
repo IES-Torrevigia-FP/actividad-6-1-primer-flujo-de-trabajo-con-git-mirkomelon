@@ -1,0 +1,170 @@
+
+name: Evaluación automática (Avanzada + IA) [FIX v3]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+    inputs:
+      min_commits:
+        description: "Mínimo de commits esperados"
+        required: false
+        default: "3"
+      required_files:
+        description: "Archivos obligatorios separados por coma"
+        required: false
+        default: "README.md,reflexion-6-1.md"
+
+jobs:
+  evaluar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Ejecutar evaluación
+        env:
+          MIN_COMMITS: ${{ github.event_name == 'workflow_dispatch' && inputs.min_commits || '3' }}
+          REQUIRED_FILES: ${{ github.event_name == 'workflow_dispatch' && inputs.required_files || 'README.md,reflexion-6-1.md' }}
+        run: |
+          python tools/evaluar_repo.py \
+            --repo-root . \
+            --min-commits "$MIN_COMMITS" \
+            --required "$REQUIRED_FILES" \
+            --outdir reportes
+
+      - name: Resumen en Job Summary (render perfecto)
+        if: always()
+        run: |
+          {
+            echo "### Informe de evaluación";
+            echo "";
+            if [ -f reportes/informe.md ]; then
+              cat reportes/informe.md;
+            else
+              echo "_No se generó reportes/informe.md por un error en pasos anteriores._";
+            fi
+            echo "";
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Publicar artifacts evaluación
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: informe-evaluacion
+          path: |
+            reportes/informe.md
+            reportes/informe.json
+            reportes/metricas.csv
+            reportes/arbol.txt
+
+  ia:
+    name: Redactar retro con IA
+    needs: evaluar
+    runs-on: ubuntu-latest
+
+    env:
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT || vars.AZURE_OPENAI_ENDPOINT }}
+      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT || vars.AZURE_OPENAI_DEPLOYMENT }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Descargar artifacts del job de evaluación
+        uses: actions/download-artifact@v4
+        with:
+          name: informe-evaluacion
+          path: reportes
+
+      - name: Verificar archivos descargados
+        run: |
+          echo "Contenido de reportes:" && ls -la reportes || true
+
+      - name: Detectar credenciales IA
+        id: gate
+        run: |
+          has_azure=false
+          has_openai=false
+
+          if [ -n "${AZURE_OPENAI_ENDPOINT}" ] && [ -n "${AZURE_OPENAI_API_KEY}" ] && [ -n "${AZURE_OPENAI_DEPLOYMENT}" ]; then
+            has_azure=true
+          fi
+
+          if [ -n "${OPENAI_API_KEY}" ] && [ -n "${OPENAI_MODEL}" ]; then
+            has_openai=true
+          fi
+
+          if [ "$has_azure" = true ] || [ "$has_openai" = true ]; then
+            echo "has_ai=true" >> $GITHUB_OUTPUT
+            echo "Se detectó configuración válida de IA (Azure u OpenAI)."
+          else
+            echo "has_ai=false" >> $GITHUB_OUTPUT
+            echo "No hay configuración completa de IA. Se omite la redacción con IA."
+            echo "Diagnóstico (true/false):"
+            [ -n "${AZURE_OPENAI_ENDPOINT}" ] && echo "- AZURE_OPENAI_ENDPOINT: true" || echo "- AZURE_OPENAI_ENDPOINT: false"
+            [ -n "${AZURE_OPENAI_API_KEY}" ] && echo "- AZURE_OPENAI_API_KEY: true" || echo "- AZURE_OPENAI_API_KEY: false"
+            [ -n "${AZURE_OPENAI_DEPLOYMENT}" ] && echo "- AZURE_OPENAI_DEPLOYMENT: true" || echo "- AZURE_OPENAI_DEPLOYMENT: false"
+            [ -n "${OPENAI_API_KEY}" ] && echo "- OPENAI_API_KEY: true" || echo "- OPENAI_API_KEY: false"
+            [ -n "${OPENAI_MODEL}" ] && echo "- OPENAI_MODEL: true" || echo "- OPENAI_MODEL: false"
+            echo "Evento: ${GITHUB_EVENT_NAME}"
+          fi
+
+      - name: Configurar Python
+        if: steps.gate.outputs.has_ai == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias mínimas
+        if: steps.gate.outputs.has_ai == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install python-docx requests
+
+      - name: Ejecutar redacción con IA
+        if: steps.gate.outputs.has_ai == 'true'
+        run: |
+          python tools/ai_redactor.py
+
+      - name: Publicar artifacts IA
+        if: steps.gate.outputs.has_ai == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: retroalimentacion-ia
+          path: |
+            reportes/retro.md
+            reportes/retro.docx
+
+      - name: Resumen IA (Job Summary)
+        if: steps.gate.outputs.has_ai == 'true'
+        run: |
+          {
+            echo "## Retroalimentación generada por IA";
+            echo "";
+            if [ -f reportes/retro.md ]; then
+              sed 's/$/  /' reportes/retro.md;
+            else
+              echo "_No se generó reportes/retro.md por un error en pasos anteriores._";
+            fi
+            echo "";
+            echo "_(Descarga el DOCX completo en artifacts.)_";
+          } >> $GITHUB_STEP_SUMMARY
